@@ -1,0 +1,16 @@
+{
+  "name": "discord-receipt-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that forwards messages to Activepieces",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
