@@ -7,11 +7,11 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const ACTIVEPIECES_WEBHOOK_URL = process.env.ACTIVEPIECES_WEBHOOK_URL;
 
 if (!DISCORD_TOKEN) {
-  console.error('ERROR: DISCORD_TOKEN is missing');
+  console.error('ERROR: DISCORD_TOKEN is missing from environment');
   process.exit(1);
 }
 if (!ACTIVEPIECES_WEBHOOK_URL) {
-  console.error('ERROR: ACTIVEPIECES_WEBHOOK_URL is missing');
+  console.error('ERROR: ACTIVEPIECES_WEBHOOK_URL is missing from environment');
   process.exit(1);
 }
 
@@ -23,8 +23,7 @@ let resumeGatewayUrl = null;
 let reconnectAttempts = 0;
 
 function log(message) {
-  const time = new Date().toISOString();
-  console.log(`[${time}] ${message}`);
+  console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
 function sendToActivepieces(data) {
@@ -44,21 +43,21 @@ function sendToActivepieces(data) {
       }
     };
     const req = requester.request(options, (res) => {
-      let responseData = '';
-      res.on('data', (chunk) => responseData += chunk);
-      res.on('end', () => { log(`Activepieces responded: ${res.statusCode}`); });
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => log(`Activepieces responded: ${res.statusCode}`));
     });
-    req.on('error', (error) => { log(`Error sending to Activepieces: ${error.message}`); });
+    req.on('error', err => log(`Send error: ${err.message}`));
     req.write(payload);
     req.end();
-  } catch (error) {
-    log(`Failed to send to Activepieces: ${error.message}`);
+  } catch (err) {
+    log(`Failed to send: ${err.message}`);
   }
 }
 
 function getGatewayUrl() {
   return new Promise((resolve, reject) => {
-    const options = {
+    const req = https.request({
       hostname: 'discord.com',
       path: '/api/v10/gateway/bot',
       method: 'GET',
@@ -66,21 +65,28 @@ function getGatewayUrl() {
         'Authorization': `Bot ${DISCORD_TOKEN}`,
         'Content-Type': 'application/json'
       }
-    };
-    const req = https.request(options, (res) => {
+    }, res => {
       let data = '';
-      res.on('data', (chunk) => data += chunk);
+      res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
           if (parsed.url) resolve(parsed.url);
-          else reject(new Error(`Gateway error: ${data}`));
-        } catch (e) { reject(new Error(`Parse error: ${data}`)); }
+          else reject(new Error(`No gateway URL: ${data}`));
+        } catch (e) {
+          reject(new Error(`Parse error: ${data}`));
+        }
       });
     });
     req.on('error', reject);
     req.end();
   });
+}
+
+function sendHeartbeat() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ op: 1, d: sequence }));
+  }
 }
 
 function identify() {
@@ -90,118 +96,141 @@ function identify() {
     d: {
       token: DISCORD_TOKEN,
       intents: 33281,
-      properties: { os: 'linux', browser: 'receipt-bot', device: 'receipt-bot' }
+      properties: {
+        os: 'linux',
+        browser: 'receipt-bot',
+        device: 'receipt-bot'
+      }
     }
   }));
 }
 
 function resume() {
-  log('Resuming Discord session...');
+  log('Resuming session...');
   ws.send(JSON.stringify({
     op: 6,
-    d: { token: DISCORD_TOKEN, session_id: sessionId, seq: sequence }
+    d: {
+      token: DISCORD_TOKEN,
+      session_id: sessionId,
+      seq: sequence
+    }
   }));
 }
 
 function startHeartbeat(interval) {
   if (heartbeatInterval) clearInterval(heartbeatInterval);
-  heartbeatInterval = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ op: 1, d: sequence }));
-    }
-  }, interval);
+  heartbeatInterval = setInterval(sendHeartbeat, interval);
 }
 
 async function connect(isResume = false) {
   try {
     let gatewayUrl;
-    if (isResume && resumeGatewayUrl) gatewayUrl = resumeGatewayUrl;
-    else {
+    if (isResume && resumeGatewayUrl) {
+      gatewayUrl = resumeGatewayUrl;
+    } else {
       log('Getting Discord gateway URL...');
       gatewayUrl = await getGatewayUrl();
     }
-    const wsUrl = `${gatewayUrl}?v=10&encoding=json`;
-    log(`Connecting to Discord: ${wsUrl}`);
-    ws = new WebSocket(wsUrl);
 
-    ws.on('open', () => { log('WebSocket connection opened'); reconnectAttempts = 0; });
+    log(`Connecting to: ${gatewayUrl}`);
+    ws = new WebSocket(`${gatewayUrl}?v=10&encoding=json`);
 
-    ws.on('message', (data) => {
+    ws.on('open', () => {
+      log('WebSocket opened');
+      reconnectAttempts = 0;
+    });
+
+    ws.on('message', data => {
       try {
         const payload = JSON.parse(data.toString());
         if (payload.s) sequence = payload.s;
+
         switch (payload.op) {
           case 10:
-            log('Received Hello from Discord');
+            log('Hello received from Discord');
             startHeartbeat(payload.d.heartbeat_interval);
             if (isResume && sessionId) resume();
             else identify();
             break;
-          case 11: break;
+          case 11:
+            break;
           case 9:
-            log('Session invalidated, reconnecting fresh...');
-            sessionId = null; sequence = null;
+            log('Session invalid - fresh connect in 5s');
+            sessionId = null;
+            sequence = null;
             setTimeout(() => connect(false), 5000);
             break;
           case 7:
-            log('Discord requested reconnect');
+            log('Reconnect requested');
             ws.close();
             setTimeout(() => connect(true), 1000);
             break;
-          case 0: handleDispatch(payload); break;
-          default: break;
+          case 0:
+            handleEvent(payload);
+            break;
         }
-      } catch (error) { log(`Error parsing message: ${error.message}`); }
+      } catch (err) {
+        log(`Message parse error: ${err.message}`);
+      }
     });
 
-    ws.on('close', (code) => {
-      log(`WebSocket closed. Code: ${code}`);
+    ws.on('close', code => {
+      log(`WebSocket closed: ${code}`);
       if (heartbeatInterval) clearInterval(heartbeatInterval);
-      const fatalCodes = [4004, 4010, 4011, 4012, 4013, 4014];
-      if (fatalCodes.includes(code)) { log(`Fatal error code ${code}. Check your bot token.`); process.exit(1); }
+      const fatal = [4004, 4010, 4011, 4012, 4013, 4014];
+      if (fatal.includes(code)) {
+        log(`Fatal code ${code} - check bot token`);
+        process.exit(1);
+      }
       reconnectAttempts++;
       const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-      log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+      log(`Reconnecting in ${delay}ms`);
       setTimeout(() => connect(true), delay);
     });
 
-    ws.on('error', (error) => { log(`WebSocket error: ${error.message}`); });
-  } catch (error) {
-    log(`Connection error: ${error.message}`);
+    ws.on('error', err => log(`WebSocket error: ${err.message}`));
+
+  } catch (err) {
+    log(`Connection failed: ${err.message}`);
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-    log(`Retrying in ${delay}ms`);
     setTimeout(() => connect(false), delay);
   }
 }
 
-function handleDispatch(payload) {
+function handleEvent(payload) {
   switch (payload.t) {
     case 'READY':
       sessionId = payload.d.session_id;
       resumeGatewayUrl = payload.d.resume_gateway_url;
-      log(`Bot ready! Logged in as: ${payload.d.user.username}`);
+      log(`Bot ready: ${payload.d.user.username}`);
       break;
-    case 'RESUMED': log('Session resumed successfully'); break;
-    case 'MESSAGE_CREATE': handleMessage(payload.d); break;
-    default: break;
+    case 'RESUMED':
+      log('Session resumed');
+      break;
+    case 'MESSAGE_CREATE':
+      handleMessage(payload.d);
+      break;
   }
 }
 
 function handleMessage(message) {
-  if (message.author && message.author.bot) return;
-  if (!message.content && (!message.attachments || message.attachments.length === 0)) return;
-  log(`Message from ${message.author.username}: ${message.content || '[attachment]'}`);
+  if (message.author?.bot) return;
+  if (!message.content && !message.attachments?.length) return;
 
-  const imageAttachments = message.attachments ? message.attachments.filter(att => {
-    const filename = att.filename.toLowerCase();
-    return filename.endsWith('.jpg') || filename.endsWith('.jpeg') ||
-           filename.endsWith('.png') || filename.endsWith('.webp') ||
-           filename.endsWith('.gif') ||
-           (att.content_type && att.content_type.startsWith('image/'));
-  }) : [];
+  log(`Message from ${message.author.username}: ${message.content || '[file]'}`);
 
-  const dataToSend = {
+  const images = (message.attachments || []).filter(att => {
+    const name = att.filename.toLowerCase();
+    return name.endsWith('.jpg') ||
+           name.endsWith('.jpeg') ||
+           name.endsWith('.png') ||
+           name.endsWith('.webp') ||
+           name.endsWith('.gif') ||
+           att.content_type?.startsWith('image/');
+  });
+
+  const data = {
     messageId: message.id,
     content: message.content || '',
     authorId: message.author.id,
@@ -210,20 +239,23 @@ function handleMessage(message) {
     channelId: message.channel_id,
     guildId: message.guild_id || null,
     timestamp: message.timestamp,
-    hasAttachment: imageAttachments.length > 0,
-    attachmentUrl: imageAttachments.length > 0 ? imageAttachments[0].url : null,
-    attachmentFilename: imageAttachments.length > 0 ? imageAttachments[0].filename : null,
-    attachmentContentType: imageAttachments.length > 0 ? imageAttachments[0].content_type : null,
-    allAttachments: imageAttachments.map(att => ({
-      url: att.url, filename: att.filename, size: att.size, content_type: att.content_type
+    hasAttachment: images.length > 0,
+    attachmentUrl: images[0]?.url || null,
+    attachmentFilename: images[0]?.filename || null,
+    attachmentContentType: images[0]?.content_type || null,
+    allAttachments: images.map(a => ({
+      url: a.url,
+      filename: a.filename,
+      size: a.size,
+      content_type: a.content_type
     }))
   };
 
-  log(`Forwarding to Activepieces: hasAttachment=${dataToSend.hasAttachment}`);
-  sendToActivepieces(dataToSend);
+  log(`Forwarding to Activepieces - hasAttachment: ${data.hasAttachment}`);
+  sendToActivepieces(data);
 }
 
 log('Starting Discord Receipt Bot...');
-log(`Token starts with: ${DISCORD_TOKEN.substring(0, 10)}...`);
-log(`Webhook: ${ACTIVEPIECES_WEBHOOK_URL.substring(0, 50)}...`);
+log(`Token preview: ${DISCORD_TOKEN.substring(0, 10)}...`);
+log(`Webhook preview: ${ACTIVEPIECES_WEBHOOK_URL.substring(0, 50)}...`);
 connect(false);
