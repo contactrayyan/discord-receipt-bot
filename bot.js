@@ -94,50 +94,6 @@ function sendToActivepieces(data) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        'Accept': 'application/json'
-      }
-    };
-
-    log(`Sending POST to: ${url.pathname}`);
-    log(`Payload size: ${payload.length} bytes`);
-
-    const req = requester.request(options, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        log(`Activepieces responded: ${res.statusCode}`);
-        log(`Response body: ${body.substring(0, 200)}`);
-      });
-    });
-
-    req.on('error', err => log(`Send error: ${err.message}`));
-    req.setTimeout(15000, () => {
-      log('Request timed out');
-      req.destroy();
-    });
-
-    req.write(payload);
-    req.end();
-
-  } catch (err) {
-    log(`Failed to send: ${err.message}`);
-  }
-}
-  const payload = JSON.stringify(data);
-
-  try {
-    const url = new URL(ACTIVEPIECES_WEBHOOK_URL);
-    const isHttps = url.protocol === 'https:';
-    const requester = isHttps ? https : http;
-
-    const options = {
-      hostname: url.hostname,
-      port: url.port || (isHttps ? 443 : 80),
-      path: url.pathname + url.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(payload)
       }
     };
