@@ -346,8 +346,130 @@ function handleEvent(payload) {
 // ============================================================
 // MESSAGE HANDLER
 // ============================================================
+// ============================================================
+// DOWNLOAD IMAGE AND CONVERT TO BASE64
+// ============================================================
 
+function downloadImageAsBase64(imageUrl, contentType, callback) {
+  try {
+    const url = new URL(imageUrl);
+    const requester = url.protocol === 'https:' ? https : http;
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'ReceiptBot/1.0'
+      }
+    };
+
+    const req = requester.request(options, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        log(`Redirect to: ${res.headers.location}`);
+        downloadImageAsBase64(res.headers.location, contentType, callback);
+        return;
+      }
+
+      if (res.statusCode !== 200) {
+        callback(new Error(`HTTP ${res.statusCode}`), null);
+        return;
+      }
+
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const base64 = buffer.toString('base64');
+        log(`Image downloaded: ${buffer.length} bytes → ${base64.length} base64 chars`);
+        callback(null, base64);
+      });
+      res.on('error', err => callback(err, null));
+    });
+
+    req.on('error', err => callback(err, null));
+    req.setTimeout(15000, () => {
+      req.destroy();
+      callback(new Error('Download timed out'), null);
+    });
+
+    req.end();
+
+  } catch (err) {
+    callback(err, null);
+  }
+}
 function handleMessage(message) {
+  if (message.author && message.author.bot) return;
+  if (!message.content && (!message.attachments || message.attachments.length === 0)) return;
+
+  log(`Message from ${message.author.username}: ${message.content || '[attachment]'}`);
+
+  const images = (message.attachments || []).filter(att => {
+    const name = (att.filename || '').toLowerCase();
+    return name.endsWith('.jpg') ||
+           name.endsWith('.jpeg') ||
+           name.endsWith('.png') ||
+           name.endsWith('.webp') ||
+           name.endsWith('.gif') ||
+           name.endsWith('.bmp') ||
+           (att.content_type && att.content_type.startsWith('image/'));
+  });
+
+  if (images.length > 0) {
+    log(`Downloading image before URL expires: ${images[0].filename}`);
+    downloadImageAsBase64(images[0].url, images[0].content_type || 'image/jpeg', (err, base64Data) => {
+      if (err) {
+        log(`Failed to download image: ${err.message}`);
+        base64Data = null;
+      }
+
+      const data = {
+        messageId: message.id,
+        content: message.content || '',
+        authorId: message.author.id,
+        authorUsername: message.author.username,
+        authorGlobalName: message.author.global_name || message.author.username,
+        channelId: message.channel_id,
+        guildId: message.guild_id || null,
+        timestamp: message.timestamp,
+        hasAttachment: true,
+        attachmentFilename: images[0].filename,
+        attachmentContentType: images[0].content_type || 'image/jpeg',
+        attachmentSize: images[0].size,
+        attachmentBase64: base64Data,
+        attachmentBase64DataUrl: base64Data
+          ? `data:${images[0].content_type || 'image/jpeg'};base64,${base64Data}`
+          : null
+      };
+
+      log(`Forwarding with base64 image: ${base64Data ? 'YES' : 'NO (download failed)'}`);
+      sendToActivepieces(data);
+    });
+
+  } else {
+    const data = {
+      messageId: message.id,
+      content: message.content || '',
+      authorId: message.author.id,
+      authorUsername: message.author.username,
+      authorGlobalName: message.author.global_name || message.author.username,
+      channelId: message.channel_id,
+      guildId: message.guild_id || null,
+      timestamp: message.timestamp,
+      hasAttachment: false,
+      attachmentFilename: null,
+      attachmentContentType: null,
+      attachmentSize: null,
+      attachmentBase64: null,
+      attachmentBase64DataUrl: null
+    };
+
+    log(`Forwarding text message`);
+    sendToActivepieces(data);
+  }
+}
   if (message.author && message.author.bot) return;
   if (!message.content && (!message.attachments || message.attachments.length === 0)) return;
 
