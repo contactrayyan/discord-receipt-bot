@@ -1,15 +1,17 @@
 require('dotenv').config();
+
 const WebSocket = require('ws');
 const https = require('https');
 const http = require('http');
 
 // ============================================================
-// CONFIGURATION
+// Configuration
 // ============================================================
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const ACTIVEPIECES_WEBHOOK_URL = process.env.ACTIVEPIECES_WEBHOOK_URL;
-const PORT = process.env.PORT || 80;
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null;
+const PORT = Number(process.env.PORT || 80);
 
 if (!DISCORD_TOKEN) {
   console.error('ERROR: DISCORD_TOKEN is missing');
@@ -22,31 +24,55 @@ if (!ACTIVEPIECES_WEBHOOK_URL) {
 }
 
 // ============================================================
-// WEB SERVER - required by Railway for health checks on port 80
+// Logging
+// ============================================================
+
+function log(message) {
+  console.log(`[${new Date().toISOString()}] ${message}`);
+}
+
+// ============================================================
+// Discord WebSocket State
+// ============================================================
+
+let ws;
+let heartbeatInterval;
+let sequence = null;
+let sessionId = null;
+let resumeGatewayUrl = null;
+let reconnectAttempts = 0;
+let lastHeartbeatAck = true;
+
+// ============================================================
+// Web Server — required by Railway health checks
 // ============================================================
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
+  if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      service: 'discord-receipt-bot',
-      timestamp: new Date().toISOString(),
-      discord: ws && ws.readyState === WebSocket.OPEN ? 'connected' : 'connecting',
-      uptime: process.uptime()
-    }));
+    res.end(
+      JSON.stringify({
+        status: 'ok',
+        service: 'discord-receipt-bot',
+        timestamp: new Date().toISOString(),
+        discord: ws && ws.readyState === WebSocket.OPEN ? 'connected' : 'connecting',
+        uptime: process.uptime(),
+      })
+    );
     return;
   }
 
   if (req.url === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'running',
-      discord_connected: ws && ws.readyState === WebSocket.OPEN,
-      reconnect_attempts: reconnectAttempts,
-      uptime_seconds: Math.floor(process.uptime()),
-      memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
-    }));
+    res.end(
+      JSON.stringify({
+        status: 'running',
+        discord_connected: ws && ws.readyState === WebSocket.OPEN,
+        reconnect_attempts: reconnectAttempts,
+        uptime_seconds: Math.floor(process.uptime()),
+        memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      })
+    );
     return;
   }
 
@@ -61,22 +87,11 @@ server.listen(PORT, '0.0.0.0', () => {
 
 server.on('error', (err) => {
   log(`Web server error: ${err.message}`);
-  if (err.code === 'EADDRINUSE') {
-    log(`Port ${PORT} already in use`);
-    process.exit(1);
-  }
+  if (err.code === 'EADDRINUSE') process.exit(1);
 });
 
 // ============================================================
-// LOGGING
-// ============================================================
-
-function log(message) {
-  console.log(`[${new Date().toISOString()}] ${message}`);
-}
-
-// ============================================================
-// SEND TO ACTIVEPIECES
+// Send Payload to Activepieces
 // ============================================================
 
 function sendToActivepieces(data) {
@@ -90,87 +105,74 @@ function sendToActivepieces(data) {
     const options = {
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
-      path: url.pathname + url.search,
+      path: `${url.pathname}${url.search}`,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload)
-      }
+        'Content-Length': Buffer.byteLength(payload),
+      },
     };
 
     const req = requester.request(options, (res) => {
       let body = '';
-      res.on('data', chunk => body += chunk);
+      res.on('data', (chunk) => (body += chunk));
       res.on('end', () => {
         log(`Activepieces responded: ${res.statusCode}`);
-        if (res.statusCode !== 200) {
-          log(`Response body: ${body}`);
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          log(`Activepieces response body: ${body}`);
         }
       });
     });
 
-    req.on('error', err => log(`Send error: ${err.message}`));
+    req.on('error', (err) => log(`Send error: ${err.message}`));
     req.setTimeout(10000, () => {
-      log('Request timed out');
+      log('Activepieces request timed out');
       req.destroy();
     });
 
     req.write(payload);
     req.end();
-
   } catch (err) {
-    log(`Failed to send: ${err.message}`);
+    log(`Failed to send to Activepieces: ${err.message}`);
   }
 }
 
 // ============================================================
-// DISCORD GATEWAY
+// Discord Gateway Helpers
 // ============================================================
 
 function getGatewayUrl() {
   return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'discord.com',
-      path: '/api/v10/gateway/bot',
-      method: 'GET',
-      headers: {
-        'Authorization': `Bot ${DISCORD_TOKEN}`,
-        'Content-Type': 'application/json'
+    const req = https.request(
+      {
+        hostname: 'discord.com',
+        path: '/api/v10/gateway/bot',
+        method: 'GET',
+        headers: {
+          Authorization: `Bot ${DISCORD_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.url) resolve(parsed.url);
+            else reject(new Error(`No gateway URL returned: ${data}`));
+          } catch (error) {
+            reject(new Error(`Gateway parse error: ${data}`));
+          }
+        });
       }
-    }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.url) resolve(parsed.url);
-          else reject(new Error(`No gateway URL: ${data}`));
-        } catch (e) {
-          reject(new Error(`Parse error: ${data}`));
-        }
-      });
-    });
+    );
+
     req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); });
+    req.setTimeout(10000, () => req.destroy());
     req.end();
   });
 }
-
-// ============================================================
-// DISCORD WEBSOCKET STATE
-// ============================================================
-
-let ws;
-let heartbeatInterval;
-let sequence = null;
-let sessionId = null;
-let resumeGatewayUrl = null;
-let reconnectAttempts = 0;
-let lastHeartbeatAck = true;
-
-// ============================================================
-// HEARTBEAT
-// ============================================================
 
 function startHeartbeat(interval) {
   if (heartbeatInterval) clearInterval(heartbeatInterval);
@@ -179,7 +181,7 @@ function startHeartbeat(interval) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     if (!lastHeartbeatAck) {
-      log('No heartbeat ACK - connection dead, reconnecting...');
+      log('No heartbeat ACK received. Reconnecting...');
       ws.terminate();
       return;
     }
@@ -189,40 +191,40 @@ function startHeartbeat(interval) {
   }, interval);
 }
 
-// ============================================================
-// IDENTIFY AND RESUME
-// ============================================================
-
 function identify() {
   log('Identifying with Discord...');
-  ws.send(JSON.stringify({
-    op: 2,
-    d: {
-      token: DISCORD_TOKEN,
-      intents: 33281,
-      properties: {
-        os: 'linux',
-        browser: 'receipt-bot',
-        device: 'receipt-bot'
-      }
-    }
-  }));
+  ws.send(
+    JSON.stringify({
+      op: 2,
+      d: {
+        token: DISCORD_TOKEN,
+        intents: 33281,
+        properties: {
+          os: 'linux',
+          browser: 'receipt-bot',
+          device: 'receipt-bot',
+        },
+      },
+    })
+  );
 }
 
 function resume() {
   log('Resuming Discord session...');
-  ws.send(JSON.stringify({
-    op: 6,
-    d: {
-      token: DISCORD_TOKEN,
-      session_id: sessionId,
-      seq: sequence
-    }
-  }));
+  ws.send(
+    JSON.stringify({
+      op: 6,
+      d: {
+        token: DISCORD_TOKEN,
+        session_id: sessionId,
+        seq: sequence,
+      },
+    })
+  );
 }
 
 // ============================================================
-// MAIN CONNECTION
+// Main Discord Connection
 // ============================================================
 
 async function connect(isResume = false) {
@@ -251,13 +253,11 @@ async function connect(isResume = false) {
       try {
         const payload = JSON.parse(data.toString());
 
-        if (payload.s !== null && payload.s !== undefined) {
-          sequence = payload.s;
-        }
+        if (payload.s !== null && payload.s !== undefined) sequence = payload.s;
 
         switch (payload.op) {
           case 10:
-            log(`Hello received - heartbeat every ${payload.d.heartbeat_interval}ms`);
+            log(`Hello received — heartbeat every ${payload.d.heartbeat_interval}ms`);
             startHeartbeat(payload.d.heartbeat_interval);
             if (isResume && sessionId) resume();
             else identify();
@@ -268,10 +268,10 @@ async function connect(isResume = false) {
             break;
 
           case 9:
-            log('Session invalid - reconnecting');
+            log('Session invalid. Reconnecting...');
             sessionId = null;
             sequence = null;
-            setTimeout(() => connect(payload.d), payload.d ? 1000 : 5000);
+            setTimeout(() => connect(Boolean(payload.d)), payload.d ? 1000 : 5000);
             break;
 
           case 7:
@@ -284,45 +284,44 @@ async function connect(isResume = false) {
             handleEvent(payload);
             break;
         }
-
       } catch (err) {
-        log(`Message error: ${err.message}`);
+        log(`Message handling error: ${err.message}`);
       }
     });
 
     ws.on('close', (code) => {
       log(`WebSocket closed: ${code}`);
+
       if (heartbeatInterval) {
         clearInterval(heartbeatInterval);
         heartbeatInterval = null;
       }
 
-      const fatal = [4004, 4010, 4011, 4012, 4013, 4014];
-      if (fatal.includes(code)) {
-        log(`Fatal code ${code} - check DISCORD_TOKEN`);
+      const fatalCodes = [4004, 4010, 4011, 4012, 4013, 4014];
+      if (fatalCodes.includes(code)) {
+        log(`Fatal Discord gateway code ${code}. Check your token and intents.`);
         process.exit(1);
       }
 
-      reconnectAttempts++;
+      reconnectAttempts += 1;
       const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-      log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
-      setTimeout(() => connect(!!sessionId && code !== 1000), delay);
+      log(`Reconnecting in ${delay}ms. Attempt ${reconnectAttempts}`);
+      setTimeout(() => connect(Boolean(sessionId) && code !== 1000), delay);
     });
 
     ws.on('error', (err) => {
       log(`WebSocket error: ${err.message}`);
     });
-
   } catch (err) {
     log(`Connection failed: ${err.message}`);
-    reconnectAttempts++;
+    reconnectAttempts += 1;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
     setTimeout(() => connect(false), delay);
   }
 }
 
 // ============================================================
-// EVENT HANDLER
+// Discord Event Handlers
 // ============================================================
 
 function handleEvent(payload) {
@@ -334,7 +333,7 @@ function handleEvent(payload) {
       break;
 
     case 'RESUMED':
-      log('Session resumed');
+      log('Discord session resumed');
       break;
 
     case 'MESSAGE_CREATE':
@@ -343,25 +342,24 @@ function handleEvent(payload) {
   }
 }
 
-// ============================================================
-// MESSAGE HANDLER
-// ============================================================
-
 function handleMessage(message) {
   if (message.author && message.author.bot) return;
+  if (DISCORD_CHANNEL_ID && message.channel_id !== DISCORD_CHANNEL_ID) return;
   if (!message.content && (!message.attachments || message.attachments.length === 0)) return;
 
   log(`Message from ${message.author.username}: ${message.content || '[attachment]'}`);
 
-  const images = (message.attachments || []).filter(att => {
+  const images = (message.attachments || []).filter((att) => {
     const name = (att.filename || '').toLowerCase();
-    return name.endsWith('.jpg') ||
-           name.endsWith('.jpeg') ||
-           name.endsWith('.png') ||
-           name.endsWith('.webp') ||
-           name.endsWith('.gif') ||
-           name.endsWith('.bmp') ||
-           (att.content_type && att.content_type.startsWith('image/'));
+    return (
+      name.endsWith('.jpg') ||
+      name.endsWith('.jpeg') ||
+      name.endsWith('.png') ||
+      name.endsWith('.webp') ||
+      name.endsWith('.gif') ||
+      name.endsWith('.bmp') ||
+      (att.content_type && att.content_type.startsWith('image/'))
+    );
   });
 
   const data = {
@@ -376,40 +374,38 @@ function handleMessage(message) {
     hasAttachment: images.length > 0,
     attachmentUrl: images.length > 0 ? images[0].url : null,
     attachmentFilename: images.length > 0 ? images[0].filename : null,
-    attachmentContentType: images.length > 0 ? (images[0].content_type || 'image/jpeg') : null,
+    attachmentContentType: images.length > 0 ? images[0].content_type || 'image/jpeg' : null,
     attachmentSize: images.length > 0 ? images[0].size : null,
-    allAttachments: images.map(a => ({
+    allAttachments: images.map((a) => ({
       url: a.url,
       filename: a.filename,
       size: a.size,
-      content_type: a.content_type || 'image/jpeg'
-    }))
+      content_type: a.content_type || 'image/jpeg',
+    })),
   };
 
-  log(`Forwarding - hasAttachment: ${data.hasAttachment}`);
-  if (data.hasAttachment) log(`File: ${data.attachmentFilename}`);
-
+  log(`Forwarding to Activepieces. hasAttachment=${data.hasAttachment}`);
   sendToActivepieces(data);
 }
 
 // ============================================================
-// GRACEFUL SHUTDOWN
+// Graceful Shutdown
 // ============================================================
 
 process.on('SIGTERM', () => {
-  log('SIGTERM - shutting down');
+  log('SIGTERM received. Shutting down...');
   if (ws) ws.close(1000);
   server.close(() => process.exit(0));
 });
 
 process.on('SIGINT', () => {
-  log('SIGINT - shutting down');
+  log('SIGINT received. Shutting down...');
   if (ws) ws.close(1000);
   server.close(() => process.exit(0));
 });
 
 process.on('uncaughtException', (err) => {
-  log(`Uncaught exception: ${err.message}`);
+  log(`Uncaught exception: ${err.stack || err.message}`);
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -417,7 +413,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ============================================================
-// START
+// Start
 // ============================================================
 
 log('='.repeat(50));
